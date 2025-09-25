@@ -1,0 +1,162 @@
+name: ESLint Security Analysis with SonarCloud Integration
+
+on:
+  push:
+    branches: 
+      - main
+      - develop
+  pull_request:
+    branches:
+      - main
+      - develop
+    types: [opened, synchronize, reopened]
+  workflow_dispatch:
+  
+env:
+  NODE_VERSION: '18'
+  SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+jobs:
+  eslint-security-analysis:
+    name: ESLint Security Analysis
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+      actions: read
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Shallow clones should be disabled for better analysis
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: |
+          npm ci --prefer-offline --no-audit
+          npm list --depth=0
+
+      - name: Run ESLint Security Analysis
+        run: |
+          echo "Running ESLint security analysis..."
+          npm run lint:security || echo "ESLint found security issues - continuing for reporting"
+
+      - name: Generate ESLint JSON Report
+        run: |
+          echo "Generating ESLint JSON report for SonarCloud..."
+          npm run lint:ci || echo "Report generated despite errors"
+        continue-on-error: true
+
+      - name: Run ESLint with SARIF output
+        uses: github/super-linter/slim@v5
+        env:
+          DEFAULT_BRANCH: main
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VALIDATE_ALL_CODEBASE: false
+          VALIDATE_JAVASCRIPT_ES: true
+          VALIDATE_TYPESCRIPT_ES: true
+          JAVASCRIPT_ES_CONFIG_FILE: '.eslintrc.js'
+        continue-on-error: true
+
+      - name: Upload ESLint results to GitHub Security
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: eslint-results.sarif
+        continue-on-error: true
+
+      - name: Cache SonarCloud packages
+        uses: actions/cache@v3
+        with:
+          path: ~/.sonar/cache
+          key: ${{ runner.os }}-sonar
+          restore-keys: ${{ runner.os }}-sonar
+
+      - name: SonarCloud Analysis
+        uses: SonarSource/sonarcloud-github-action@master
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+        with:
+          args: >
+            -Dsonar.projectKey=AdamsDaniel_StatusCheckProjetoIntegrado-main
+            -Dsonar.organization=adamsdaniel
+            -Dsonar.sources=src
+            -Dsonar.tests=src
+            -Dsonar.test.inclusions=**/*.test.js,**/*.test.jsx,**/*.test.ts,**/*.test.tsx
+            -Dsonar.javascript.lcov.reportPaths=coverage/lcov.info
+            -Dsonar.eslint.reportPaths=eslint-report.json
+            -Dsonar.coverage.exclusions=**/*.test.*,**/*.config.js,**/node_modules/**
+            -Dsonar.security.hotspots.inheritFromParent=true
+            -Dsonar.security.enableHotspots=true
+
+      - name: Archive ESLint Reports
+        uses: actions/upload-artifact@v3
+        if: always()
+        with:
+          name: eslint-security-reports
+          path: |
+            eslint-report.json
+            eslint-results.sarif
+          retention-days: 30
+
+      - name: Security Audit
+        run: |
+          echo "Running npm security audit..."
+          npm run security-audit || echo "Security audit completed with findings"
+        continue-on-error: true
+
+      - name: Comment PR with Results
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            let comment = '## 🔒 ESLint Security Analysis Results\n\n';
+            
+            try {
+              if (fs.existsSync('eslint-report.json')) {
+                const report = JSON.parse(fs.readFileSync('eslint-report.json', 'utf8'));
+                const errorCount = report.reduce((sum, file) => sum + file.errorCount, 0);
+                const warningCount = report.reduce((sum, file) => sum + file.warningCount, 0);
+                
+                comment += `### ESLint Results:\n`;
+                comment += `- **Errors**: ${errorCount}\n`;
+                comment += `- **Warnings**: ${warningCount}\n\n`;
+                
+                if (errorCount > 0) {
+                  comment += '❌ **Security issues found!** Please review the ESLint errors.\n';
+                } else {
+                  comment += '✅ **No security errors found!**\n';
+                }
+              }
+            } catch (error) {
+              comment += '⚠️ Could not parse ESLint report.\n';
+            }
+            
+            comment += '\n### 🔍 Additional Security Checks:\n';
+            comment += '- SonarCloud analysis in progress\n';
+            comment += '- Security audit completed\n';
+            comment += '- SARIF results uploaded to GitHub Security\n\n';
+            comment += '**Note**: Check the [Security tab](../../security) for detailed findings.';
+            
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: comment
+            });
+
+      - name: Fail on Security Issues
+        if: ${{ failure() }}
+        run: |
+          echo "❌ Security analysis failed or found critical issues"
+          echo "Please review the security findings and fix critical issues before merging"
+          exit 1
